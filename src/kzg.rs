@@ -3,15 +3,54 @@
 use std::{borrow::Borrow, iter::from_fn};
 
 use super::poly::Poly;
-use bls12_381::*;
+ use bls12_381::{G2Affine, G2Projective, G2Prepared, pairing, G1AffineA, multi_miller_loop, G1ProjectiveA, G1Precompute, G1PrecomputeAffine, util::VarTime};
+use itertools::Itertools;
 use once_cell::sync::Lazy;
+
+
+type G1Projective = bls12_381::G1Projective<true>;
+type G1Affine = bls12_381::G1Affine<true>;
+
+use crate::Scalar;
 
 /// A KZG prover which can generate polynomial commitment and proofs
 pub trait Prover {
     /// Generate a polynomial and its commitment from a `set` of points
-    fn poly_commitment_from_set(&self, set: &[(Scalar, Scalar)]) -> (Poly, Commitment);
+    fn poly_commitment_from_set(&self, set: &[(Scalar, Scalar)]) -> (Poly, Commitment) {
+        let poly = Poly::lagrange(set);
+        let commitment = self.eval_g1(poly.iter());
+        (poly, commitment)
+    }
+
     /// Generates a proof that `points` exists in `set`
-    fn prove(&self, poly: Poly, points: &[(Scalar, Scalar)]) -> Proof;
+    #[allow(non_snake_case)]
+    fn prove<'a, 'b: 'a>(&self, poly: Poly<'a>, points: &[(Scalar, Scalar)]) -> Proof {
+        // compute a lagrange polynomial I that have all the points to proof that are in the set
+        // compute the polynomial Z that has roots (y=0) in all x's of I,
+        // so this is I=(x-x0)(x-x1)...(x-xn)
+        let I = Poly::lagrange(points);
+        Self::prove_with_poly(&self, poly, &I, points)
+    }
+
+    /// Generates a proof that `points` exists in `set` with a pre-calculated lagrange polynomial
+    #[allow(non_snake_case)]
+    fn prove_with_poly<'a, 'b: 'a>(&self, mut poly: Poly<'a>, I: &Poly<'b>, points: &[(Scalar, Scalar)]) -> Proof {
+        //let Z = Poly::z_poly_of(points);
+
+        // now compute that Q = ( P - I(x) ) / Z(x)
+        // also check that the division does not have remainder
+        poly -= I;
+        // let (Q, remainder) = poly / Z;
+        // assert!(remainder.is_zero());
+        let Q = poly.div_by_z_poly_of(points);
+
+        // the proof is evaluating the Q at tau in G1
+        self.eval_g1(Q.iter())
+    }
+
+    /// Generates a proof given the Q polynomial
+    #[doc(hidden)]
+    fn eval_g1<'a, 'b: 'a>(&self, poly: impl Iterator<Item = &'a Scalar>) -> Proof;
 }
 
 #[derive(Clone, Copy)]
@@ -33,12 +72,12 @@ impl TrustedTau {
         }
     }
     pub fn eval_g2<'a>(&self, mut poly: impl Iterator<Item = &'a Scalar>) -> G2Projective {
-        match poly.next().map(|k| G2Affine::generator() * k) {
+        match poly.next().map(|k| G2Affine::generator() * k.vartime()) {
             None => G2Projective::identity(),
             Some(v) => {
                 poly.fold((v, self.0), |(acc, pow_tau), k| {
                     (
-                        acc + G2Affine::generator() * (pow_tau * k),
+                        acc + G2Affine::generator() * (pow_tau * k).vartime(),
                         pow_tau * self.0,
                     )
                 })
@@ -67,11 +106,21 @@ impl TrustedTau {
         })
     }
 
+    pub fn g1_projective_a_iter(self) -> impl Iterator<Item = G1ProjectiveA> {
+        let tau = self.0;
+        let mut v = tau;
+        from_fn(move || {
+            let ret = G1ProjectiveA::generator().mul(&v.vartime());
+            v *= tau;
+            Some(ret)
+        })
+    }
+
     pub fn g2_projective_iter(self) -> impl Iterator<Item = G2Projective> {
         let tau = self.0;
         let mut v = tau;
         from_fn(move || {
-            let ret = G2Affine::generator() * v;
+            let ret = G2Affine::generator() * v.vartime();
             v *= tau;
             Some(ret)
         })
@@ -80,7 +129,7 @@ impl TrustedTau {
         let tau = self.0;
         let mut v = tau;
         from_fn(move || {
-            let ret = G2Affine::generator() * v;
+            let ret = G2Affine::generator() * v.vartime();
             v *= tau;
             Some(ret.into())
         })
@@ -102,29 +151,8 @@ impl TrustedProver {
 }
 
 impl Prover for TrustedProver {
-    fn poly_commitment_from_set(&self, set: &[(Scalar, Scalar)]) -> (Poly, Commitment) {
-        let poly = Poly::lagrange(set);
-        let commitment = self.tau.eval_g1(poly.iter());
-
-        (poly, commitment)
-    }
-
-    #[allow(non_snake_case)]
-    fn prove(&self, mut poly: Poly, points: &[(Scalar, Scalar)]) -> Proof {
-        // compute a lagrange poliomial I that have all the points to proof that are in the set
-        // compute the polynomial Z that has roots (y=0) in all x's of I,
-        //   so this is I=(x-x0)(x-x1)...(x-xn)
-        let I = Poly::lagrange(points);
-        let Z = Poly::z_poly_of(points);
-
-        // now compute that Q = ( P - I(x) ) / Z(x)
-        // also check that the division does not have remainder
-        poly -= &I;
-        let (Q, remainder) = poly / Z;
-        assert!(remainder.is_zero());
-
-        // the proof is evaluating the Q at tau in G1
-        self.tau.eval_g1(Q.iter())
+    fn eval_g1<'a, 'b: 'a>(&self, poly: impl Iterator<Item = &'a Scalar>) -> Proof {
+        self.tau.eval_g1(poly)
     }
 }
 
@@ -146,11 +174,11 @@ where
     <I as Iterator>::Item: Borrow<G1Affine>,
 {
     fn eval_g1<'a>(&self, mut poly: impl Iterator<Item = &'a Scalar>) -> G1Projective {
-        match poly.next().map(|k| G1Affine::generator() * k) {
+        match poly.next().map(|k| G1Affine::generator().mul(k)) {
             None => G1Projective::identity(),
             Some(v) => poly
                 .zip(self.0())
-                .fold(v, |acc, (k, tau)| acc + tau.borrow() * k),
+                .fold(v, |acc, (k, tau)| acc + tau.borrow().mul(k)),
         }
     }
 }
@@ -162,11 +190,11 @@ where
     <I as Iterator>::Item: Borrow<G1Projective>,
 {
     fn eval_g1<'a>(&self, mut poly: impl Iterator<Item = &'a Scalar>) -> G1Projective {
-        match poly.next().map(|k| G1Affine::generator() * k) {
+        match poly.next().map(|k| G1Affine::generator().mul(k)) {
             None => G1Projective::identity(),
             Some(v) => poly
                 .zip(self.0())
-                .fold(v, |acc, (k, tau)| acc + tau.borrow() * k),
+                .fold(v, |acc, (k, tau)| acc + tau.borrow().mul(k)),
         }
     }
 }
@@ -187,11 +215,11 @@ where
     <I as Iterator>::Item: Borrow<G2Affine>,
 {
     fn eval_g2<'a>(&self, mut poly: impl Iterator<Item = &'a Scalar>) -> G2Projective {
-        match poly.next().map(|k| G2Affine::generator() * k) {
+        match poly.next().map(|k| G2Affine::generator().mul::<true>(k)) {
             None => G2Projective::identity(),
             Some(v) => poly
                 .zip(self.0())
-                .fold(v, |acc, (k, tau)| acc + tau.borrow() * k),
+                .fold(v, |acc, (k, tau)| acc + tau.borrow().mul::<true>(k)),
         }
     }
 }
@@ -203,11 +231,11 @@ where
     <I as Iterator>::Item: Borrow<G2Projective>,
 {
     fn eval_g2<'a>(&self, mut poly: impl Iterator<Item = &'a Scalar>) -> G2Projective {
-        match poly.next().map(|k| G2Affine::generator() * k) {
+        match poly.next().map(|k| G2Affine::generator().mul::<true>(k)) {
             None => G2Projective::identity(),
             Some(v) => poly
                 .zip(self.0())
-                .fold(v, |acc, (k, tau)| acc + tau.borrow() * k),
+                .fold(v, |acc, (k, tau)| acc + tau.borrow().mul::<true>(k)),
         }
     }
 }
@@ -226,31 +254,8 @@ impl<G1: PowTauG1> UntrustedProver<G1> {
 }
 
 impl<G1: PowTauG1> Prover for UntrustedProver<G1> {
-    /// Generate a polynomial and its commitment from a `set` of points
-    fn poly_commitment_from_set(&self, set: &[(Scalar, Scalar)]) -> (Poly, Commitment) {
-        let poly = Poly::lagrange(set);
-        let commitment = self.pow_tau_g1.eval_g1(poly.iter());
-
-        (poly, commitment)
-    }
-
-    /// Generates a proof that `points` exists in `set`
-    #[allow(non_snake_case)]
-    fn prove(&self, mut poly: Poly, points: &[(Scalar, Scalar)]) -> Proof {
-        // compute a lagrange poliomial I that have all the points to proof that are in the set
-        // compute the polynomial Z that has roots (y=0) in all x's of I,
-        //   so this is I=(x-x0)(x-x1)...(x-xn)
-        let I = Poly::lagrange(points);
-        let Z = Poly::z_poly_of(points);
-
-        // now compute that Q = ( P - I(x) ) / Z(x)
-        // also check that the division does not have remainder
-        poly -= &I;
-        let (Q, remainder) = poly / Z;
-        assert!(remainder.is_zero());
-
-        // the proof is evaluating the Q at tau in G1
-        self.pow_tau_g1.eval_g1(Q.iter())
+    fn eval_g1<'a, 'b: 'a>(&self, poly: impl Iterator<Item = &'a Scalar>) -> Proof {
+        self.pow_tau_g1.eval_g1(poly)
     }
 }
 
@@ -318,12 +323,12 @@ impl Verifier for TrustedVerifier {
     /// ```
     #[allow(non_snake_case)]
     fn verify(&self, commitment: &G1Affine, points: &[(Scalar, Scalar)], proof: &G1Affine) -> bool {
-        let z = G2Affine::generator() * Poly::evaluate_z_poly(points, &self.tau.0);
-        let i = G1Affine::generator() * Poly::evaluate_lagrange(points, &self.tau.0);
+        let z = G2Affine::generator() * Poly::evaluate_z_poly(points, &self.tau.0).vartime();
+        let i = G1Affine::generator() * Poly::evaluate_lagrange(points, &self.tau.0).vartime();
 
-        let e1 = pairing(&proof, &z.into());
-        let p = (commitment - i).into();
-        let e2 = multi_miller_loop(&[(&p, &G2_PREPARED)]).final_exponentiation();
+        let e1 = pairing::<true>(&proof.vartime(), &z.into());
+        let p = G1Affine::from(commitment - i).vartime();
+        let e2 = multi_miller_loop(&[(&p, &G2_PREPARED)]).final_exponentiation::<true>();
 
         e1 == e2
     }
@@ -391,13 +396,69 @@ impl<G12: PowTauG1 + PowTauG2> Verifier for UntrustedVerifier<G12> {
         let I = Poly::lagrange(points);
         let Z = Poly::z_poly_of(points);
 
-        let e1 = pairing(&proof, &self.pow_tau.eval_g2(Z.iter()).into());
-        let p = (commitment - self.pow_tau.eval_g1(I.iter())).into();
-        let e2 = multi_miller_loop(&[(&p, &G2_PREPARED)]).final_exponentiation();
+        let e1 = pairing::<true>(&proof.vartime(), &self.pow_tau.eval_g2(Z.iter()).into());
+        let p = G1Affine::from(commitment - &self.pow_tau.eval_g1(I.iter())).vartime();
+        let e2 = multi_miller_loop(&[(&p, &G2_PREPARED)]).final_exponentiation::<true>();
 
         e1 == e2
     }
 }
+
+#[derive(Clone)]
+pub struct PowTauG1AffineBatch(Vec<G1PrecomputeAffine<512, VarTime>>);
+
+impl PowTauG1AffineBatch {
+    pub fn new<I>(i: I) -> Self
+    where I: IntoIterator, I::Item: Borrow<G1ProjectiveA>{
+        Self(
+            i.into_iter().map(|i| G1PrecomputeAffine::from(G1Precompute::from(*i.borrow()))).collect()
+        )
+    }
+
+    fn eval(&self, poly: &[Scalar]) -> G1ProjectiveA<VarTime> {
+        G1PrecomputeAffine::dot_product(&self.0, &poly)
+    }
+}
+
+
+/// A KZG prover which can generate polynomial commitment and proofs
+impl PowTauG1AffineBatch {
+    /// Generate a polynomial and its commitment from a `set` of points
+    pub fn poly_commitment_from_set(&self, set: &[(Scalar, Scalar)]) -> (Poly, G1ProjectiveA<VarTime>) {
+        let poly = Poly::lagrange(set);
+        let v = poly.iter().cloned().collect_vec();
+        (poly, self.eval(v.as_slice()))
+    }
+
+    /// Generates a proof that `points` exists in `set`
+    #[allow(non_snake_case)]
+    pub fn prove<'a, 'b: 'a>(&self, poly: Poly<'a>, points: &[(Scalar, Scalar)]) -> G1ProjectiveA<VarTime> {
+        // compute a lagrange polynomial I that have all the points to proof that are in the set
+        // compute the polynomial Z that has roots (y=0) in all x's of I,
+        // so this is I=(x-x0)(x-x1)...(x-xn)
+        let I = Poly::lagrange(points);
+        self.prove_with_poly(poly, &I, points)
+    }
+
+    /// Generates a proof that `points` exists in `set` with a pre-calculated lagrange polynomial
+    #[allow(non_snake_case)]
+    fn prove_with_poly<'a, 'b: 'a>(&self, mut poly: Poly<'a>, I: &Poly<'b>, points: &[(Scalar, Scalar)]) -> G1ProjectiveA<VarTime> {
+        //let Z = Poly::z_poly_of(points);
+
+        // now compute that Q = ( P - I(x) ) / Z(x)
+        // also check that the division does not have remainder
+        poly -= I;
+        // let (Q, remainder) = poly / Z;
+        // assert!(remainder.is_zero());
+        let Q = poly.div_by_z_poly_of(points);
+
+        // the proof is evaluating the Q at tau in G1
+        let v = Q.iter().cloned().collect_vec();
+        self.eval(v.as_slice())
+    }
+}
+
+
 
 pub type Proof = G1Projective;
 pub type Commitment = G1Projective;

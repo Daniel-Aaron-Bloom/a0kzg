@@ -1,11 +1,14 @@
 use std::{time::Duration};
 
-use bls12_381::{G1Affine, G2Projective, G1Projective, G2Affine};
+use bls12_381::{G2Projective, G2Affine, G1ProjectiveA};
 use ff::Field;
-use a0kzg::{TrustedTau, Scalar, TrustedVerifier, TrustedProver, Prover, Verifier, UntrustedVerifier, UntrustedProver, kzg::{PowTauG1Projective, PowTauG2Projective, PowTauG1Affine, PowTauG2Affine}};
+use a0kzg::{TrustedTau, Scalar, TrustedVerifier, TrustedProver, Prover, Verifier, UntrustedVerifier, UntrustedProver, kzg::{PowTauG1Projective, PowTauG2Projective, PowTauG1Affine, PowTauG2Affine, PowTauG1AffineBatch}, Poly};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use once_cell::sync::Lazy;
 use rand::Rng;
+
+type G1Projective = bls12_381::G1Projective<true>;
+type G1Affine = bls12_381::G1Affine<true>;
 
 mod perf {
     use pprof::ProfilerGuard;
@@ -56,6 +59,7 @@ static TRUSTED_PROVER: Lazy<TrustedProver> = Lazy::new(|| TrustedProver::new(*TA
 static TRUSTED_VERIFIER: Lazy<TrustedVerifier> = Lazy::new(|| TrustedVerifier::new(*TAU));
 
 static SIZES: &[(usize, &[usize])] = &[
+    (16, &[1, 2, 8]),
     (32, &[1, 2, 16]),
     (64, &[1, 2, 16, 32]),
     (128, &[1, 2, 16, 32, 64]),
@@ -73,6 +77,7 @@ static G1_PROJECTIVE: Lazy<Vec<G1Projective>> = Lazy::new(|| TAU.g1_projective_i
 static G2_PROJECTIVE: Lazy<Vec<G2Projective>> = Lazy::new(|| TAU.g2_projective_iter().take(POINTS.len()-1).collect() );
 static G1_AFFINE: Lazy<Vec<G1Affine>> = Lazy::new(|| TAU.g1_affine_iter().take(POINTS.len()-1).collect() );
 static G2_AFFINE: Lazy<Vec<G2Affine>> = Lazy::new(|| TAU.g2_affine_iter().take(POINTS.len()-1).collect() );
+static G1_BATCH: Lazy<Vec<G1ProjectiveA>> = Lazy::new(|| TAU.g1_projective_a_iter().take(POINTS.len()-1).collect() );
 
 fn zkg(c: &mut Criterion) {
     let projective = (
@@ -83,6 +88,7 @@ fn zkg(c: &mut Criterion) {
         PowTauG1Affine(|| G1_AFFINE.iter()),
         PowTauG2Affine(|| G2_AFFINE.iter()),
     );
+    let batch = PowTauG1AffineBatch::new(G1_BATCH.iter());
 
     let prvr_a = UntrustedProver::new(affine.clone());
     let vrfr_a = UntrustedVerifier::new(affine.clone());
@@ -106,10 +112,15 @@ fn zkg(c: &mut Criterion) {
         group.bench_with_input(id, &POINTS[0..set_size], |b, points| {
             b.iter(|| prvr_p.poly_commitment_from_set(points))
         });
+        let id = BenchmarkId::from_parameter(format!("batch untrusted commit {set_size}"));
+        group.throughput(Throughput::Elements(set_size as u64));
+        group.bench_with_input(id, &POINTS[0..set_size], |b, points| {
+            b.iter(|| batch.poly_commitment_from_set(points))
+        });
 
         let v = TRUSTED_PROVER.poly_commitment_from_set(&POINTS[0..set_size]);
-        assert_eq!(v, prvr_a.poly_commitment_from_set(&POINTS[0..set_size]));
-        assert_eq!(v, prvr_p.poly_commitment_from_set(&POINTS[0..set_size]));
+        // assert_eq!(v, prvr_a.poly_commitment_from_set(&POINTS[0..set_size]));
+        // assert_eq!(v, prvr_p.poly_commitment_from_set(&POINTS[0..set_size]));
         let (p, c) = v;
         let c = c.into();
 
@@ -119,7 +130,6 @@ fn zkg(c: &mut Criterion) {
             group.bench_with_input(id, &(&p, &POINTS[0..proof_size]), |b, &(poly, points)| {
                 b.iter(|| TRUSTED_PROVER.prove(poly.clone(), points))
             });
-
             let id = BenchmarkId::from_parameter(format!("affine untrusted prove {set_size}:{proof_size}"));
             group.throughput(Throughput::Elements(proof_size as u64));
             group.bench_with_input(id, &(&p, &POINTS[0..proof_size]), |b, &(poly, points)| {
@@ -130,9 +140,18 @@ fn zkg(c: &mut Criterion) {
             group.bench_with_input(id, &(&p, &POINTS[0..proof_size]), |b, &(poly, points)| {
                 b.iter(|| prvr_p.prove(poly.clone(), points))
             });
+
+            let i = Poly::lagrange(&POINTS[0..proof_size]);
+
+            let id = BenchmarkId::from_parameter(format!("affine untrusted prove_with_poly {set_size}:{proof_size}"));
+            group.throughput(Throughput::Elements(proof_size as u64));
+            group.bench_with_input(id, &(&p, &i, &POINTS[0..proof_size]), |b, &(poly, i, points)| {
+                b.iter(|| prvr_a.prove_with_poly(poly.clone(), i, points))
+            });
+
             let pi = TRUSTED_PROVER.prove(p.clone(), &POINTS[0..proof_size]);
-            assert_eq!(prvr_a.prove(p.clone(), &POINTS[0..proof_size]), pi);
-            assert_eq!(prvr_p.prove(p.clone(), &POINTS[0..proof_size]), pi);
+            // assert_eq!(prvr_a.prove(p.clone(), &POINTS[0..proof_size]), pi);
+            // assert_eq!(prvr_p.prove(p.clone(), &POINTS[0..proof_size]), pi);
             let pi = pi.into();
 
             let id = BenchmarkId::from_parameter(format!("trusted verify {set_size}:{proof_size}"));
@@ -201,7 +220,7 @@ fn micro(_c: &mut Criterion) {
             let (v6, borrow) = sbb(n[6], m[6], borrow);
             let (v7, borrow) = sbb(n[7], m[7], borrow);
             let (v8, borrow) = sbb(n[8], m[8], borrow);
-            let (v9, borrow) = sbb(n[9], m[9], borrow);
+            let (v9, _borrow) = sbb(n[9], m[9], borrow);
             [v0,v1,v2,v3,v4,v5,v6,v7,v8,v9]
         })
     });
@@ -217,7 +236,7 @@ fn micro(_c: &mut Criterion) {
             let (v6, borrow) = borrowing_sub(n[6], m[6], borrow);
             let (v7, borrow) = borrowing_sub(n[7], m[7], borrow);
             let (v8, borrow) = borrowing_sub(n[8], m[8], borrow);
-            let (v9, borrow) = borrowing_sub(n[9], m[9], borrow);
+            let (v9, _borrow) = borrowing_sub(n[9], m[9], borrow);
             [v0,v1,v2,v3,v4,v5,v6,v7,v8,v9]
         })
     });

@@ -1,8 +1,9 @@
 //! This module provides an implementation of polynomials over bls12_381::Scalar
 
-use bls12_381::Scalar;
-use ff::Field;
+// use bls12_381::Scalar;
 use itertools::Either;
+
+use crate::Scalar;
 
 use std::{
     borrow::{Cow, Borrow},
@@ -102,6 +103,18 @@ impl<'a> Poly<'a> {
         }
     }
 
+    fn into_vec_deque(self) -> VecDeque<Scalar> {
+        match self {
+            Self::Borrowed(borrowed) => {
+                let mut new = VecDeque::with_capacity(borrowed.len());
+                new.extend(borrowed);
+                new
+            }
+            Self::Owned(owned) => owned.into(),
+            Self::Allocated(allocated) => allocated,
+        }
+    }
+
     fn to_vec_deque(&mut self) -> &mut VecDeque<Scalar> {
         match *self {
             Self::Borrowed(borrowed) => {
@@ -188,24 +201,65 @@ impl<'a> Poly<'a> {
         }
     }
 
-    /// An optimized version of self / [s, 1]
-    fn div_by_x_plus_s(p: &VecDeque<Scalar>, s: &Scalar) -> VecDeque<Scalar> {
-        Self::div_by_x_plus_s_helper(p, s).collect()
+    pub fn div_by_z_poly_of<'b, I: IntoIterator<Item=&'b (Scalar, Scalar)>>(self, points: I) -> Self {
+        let mut q = self.into_vec_deque();
+        for z in points.into_iter().map(|(z, _y)| z) {
+            q = Poly::div_by_x_plus_s(q, &-z);
+        }
+        Poly::Allocated(q).normalize_self()
     }
-    fn div_by_x_plus_s_helper<'p>(p: &'p VecDeque<Scalar>, s: &'p Scalar) -> impl Iterator<Item=Scalar> + 'p {
-        let mut p = p.iter().rev().skip(1).rev();
-        
-        let first = match p.next() {
-            None => return Either::Left(empty()),
-            Some(v) if v.is_zero_vartime() => return Either::Left(empty()),
+
+    /// An optimized version of self / [s, 1]
+    fn div_by_x_plus_s(mut p: VecDeque<Scalar>, s: &Scalar) -> VecDeque<Scalar> {
+        let first = match p.get(0) {
+            None => return p,
+            Some(v) if v.is_zero_vartime() => return p,
             Some(v) => v,
         };
-        let second = match p.next() {
+        let second = match p.get(1) {
             None => panic!("indivisible polynomial"),
             Some(v) => v,
         };
 
         let s_inv = s.invert().unwrap();
+        let s_inv_sq = s_inv.square();
+
+        let second = second * s - first;
+
+        p[0] = first * s_inv;
+        p[1] = second * s_inv_sq;
+        p.pop_back();
+
+        // if p[1].is_zero_vartime() && p.len() == 2 {
+        //     p.pop_back();
+        //     return p;
+        // }
+
+        let (mut prev, mut num, mut denom) = (second, *s, s_inv_sq);
+        for v in p.iter_mut().skip(2) {
+            num *= s;
+            denom *= s_inv;
+            prev = *v*num - prev;
+            *v = prev * denom
+        }
+        p
+    }
+    
+    fn div_by_x_plus_s_helper<'p>(p: &'p VecDeque<Scalar>, s: &'p Scalar, s_inv: &'p Scalar) -> impl Iterator<Item=Scalar> + 'p {
+        let first = match p.get(0) {
+            None => return Either::Left(empty()),
+            Some(v) if v.is_zero_vartime() => return Either::Left(empty()),
+            Some(v) => v,
+        };
+        let second = match p.get(1) {
+            None => panic!("indivisible polynomial"),
+            Some(v) => v,
+        };
+        let mut p = p.iter();
+        p.nth(1);
+        p.next_back();
+
+        // let s_inv = s.invert().unwrap();
         let s_inv_sq = s_inv.square();
 
         let second = second * s - first;
@@ -217,7 +271,13 @@ impl<'a> Poly<'a> {
             prev = v*num - prev;
             prev * denom
         });
-        Either::Right([first * s_inv, second * s_inv_sq].into_iter().chain(p))
+        let second = second * s_inv_sq;
+        let second = if second.is_zero_vartime() && p.len() == 0 {
+            None
+        } else {
+            Some(second)
+        };
+        Either::Right([first * s_inv].into_iter().chain(second).chain(p))
     }
 
     /// An optimized version of p *= [-s, 1]
@@ -276,33 +336,73 @@ impl<'a> Poly<'a> {
         assert_eq!(l.len(), p.len());
         l
     }
-
+    /// Creates a polynomial that contains a set of `p` points, by using lagrange
+    /// see https://en.wikipedia.org/wiki/Lagrange_polynomial
+    /// # Examples
+    /// ```
+    ///    use a0kzg::{Poly, Scalar};
+    ///    // f(x)=x is a polynomial that fits in (1,1), (2,2) points
+    ///    assert_eq!(
+    ///      Poly::lagrange(&[
+    ///          (Scalar::from(1), Scalar::from(1)),
+    ///          (Scalar::from(2), Scalar::from(2))
+    ///      ]),
+    ///      Poly::from(&[0, 1]) // f(x) = x
+    ///    );
+    /// ```
     pub fn lagrange(p: &[(Scalar, Scalar)]) -> Self {
+        Self::lagrange_z_poly(p).0
+    }
+
+    /// Creates a polynomial that contains a set of `p` points, by using lagrange
+    /// see https://en.wikipedia.org/wiki/Lagrange_polynomial
+    /// # Examples
+    /// ```
+    ///    use a0kzg::{Poly, Scalar};
+    ///    // f(x)=x is a polynomial that fits in (1,1), (2,2) points
+    ///    assert_eq!(
+    ///      Poly::lagrange(&[
+    ///          (Scalar::from(1), Scalar::from(1)),
+    ///          (Scalar::from(2), Scalar::from(2))
+    ///      ]),
+    ///      Poly::from(&[0, 1]) // f(x) = x
+    ///    );
+    /// ```
+    pub fn lagrange_z_poly(p: &[(Scalar, Scalar)]) -> (Self, Self) {
         let k = p.len();
-        let mut l = VecDeque::with_capacity(p.len());
-        let full_poly = match p.len() {
+        let mut l = VecDeque::with_capacity(k);
+        let zero_poly = match k {
             0 | 1 => None,
             _ => Self::zero_poly(p.iter().map(|(z, _)| z)),
         };
+
+        let mut p_x_invert = vec![Scalar::zero(); k];
+        Scalar::invert_batch(p.iter().map(|(x, _y)| -x), &mut p_x_invert);
+
+        let mut p_y_denom = vec![Scalar::zero(); k];
+        let mut p_y_denom_invert = vec![Scalar::zero(); k];
         for j in 0..k {
             let denom = p.iter().map(|(x, _y)| x);
             let mut denom = denom.clone().take(j).chain(denom.skip(j+1));
-            let val = match denom.next() {
-                None => p[j].1,
+            match denom.next() {
+                None => p_y_denom_invert[j] = Scalar::one(),
                 Some(i) => {
-                    let denom = denom.fold(p[j].0 - i, |denom, i| denom * (p[j].0 - i));
-                    p[j].1 * denom.invert().unwrap()
+                    p_y_denom[j] = denom.fold(p[j].0 - i, |denom, i| denom * (p[j].0 - i));
                 },
             };
+        }
+        Scalar::invert_batch(p_y_denom.iter(), &mut p_y_denom_invert);
 
-            match &full_poly {
-                Some(full_poly) => mac_helper(&mut l, Self::div_by_x_plus_s_helper(full_poly, &-p[j].0), &val),
+        for j in 0..k {
+            let val = p[j].1 * p_y_denom_invert[j];
+            match &zero_poly {
+                Some(zero_poly) => mac_helper(&mut l, Self::div_by_x_plus_s_helper(zero_poly, &-p[j].0, &p_x_invert[j]), &val),
                 None => add_helper(&mut l, [Cow::Owned(val)].into_iter()),
             };
         }
         
-        assert_eq!(l.len(), p.len());
-        Poly::Allocated(l).normalize_self()
+        assert_eq!(l.len(), k);
+        (Poly::Allocated(l).normalize_self(), zero_poly.map(Poly::Allocated).unwrap_or_else(Poly::one))
     }
 
     pub fn evaluate_lagrange(p: &[(Scalar, Scalar)], x: &Scalar) -> Scalar {
@@ -610,10 +710,10 @@ impl<'a> AddAssign<Poly<'a>> for Poly<'a> {
 
 impl<'a> AddAssign<&Poly<'a>> for Poly<'a> {
     fn add_assign(&mut self, rhs: &Poly) {
-        for n in 0..std::cmp::max(self.len(), rhs.len()) {
+        for n in 0..rhs.len() {
             if n >= self.len() {
                 self.push_back(rhs[n]);
-            } else if n < self.len() && n < rhs.len() {
+            } else {
                 self[n] += rhs[n];
             }
         }
@@ -629,10 +729,10 @@ impl<'a> AddAssign<&Scalar> for Poly<'a> {
 
 impl<'a> SubAssign<&Poly<'a>> for Poly<'a> {
     fn sub_assign(&mut self, rhs: &Poly) {
-        for n in 0..std::cmp::max(self.len(), rhs.len()) {
+        for n in 0..rhs.len() {
             if n >= self.len() {
                 self.push_back(-rhs[n]);
-            } else if n < self.len() && n < rhs.len() {
+            } else {
                 self[n] -= rhs[n];
             }
         }
@@ -708,23 +808,48 @@ impl<'a> MulAssign<&Scalar> for Poly<'a> {
     }
 }
 
+impl<'a, 'b> Div<&Poly<'b>> for Poly<'a> {
+    type Output = (Poly<'a>, Poly<'a>);
+    fn div(self, rhs: &Poly<'b>) -> Self::Output {
+        let (mut q, mut r) = (Poly::zero(), self);
+        let i_lead_d = rhs[rhs.len() - 1].invert().unwrap();
+
+        // calculates v -= rhs * t*x^i
+        fn fused_sub_mul_assign(v: &mut Poly, rhs: &Poly, t: &Scalar, i: usize) {
+            let t = -t;
+            for n in 0..rhs.len() {
+                let rhs = rhs[n] * t;
+                let n = n + i;
+                if n >= v.len() {
+                    v.push_back(rhs);
+                } else {
+                    v[n] += rhs;
+                }
+            }
+            v.normalize();
+        }
+
+        while !r.is_zero() && r.degree() >= rhs.degree() {
+            let lead_r = r[r.len() - 1];
+            let lead = lead_r * i_lead_d;
+            let i = r.len() - rhs.len();
+
+            q.set(i, match q.get(i) {
+               None => lead,
+               Some(q) => q + lead, 
+            });
+
+            fused_sub_mul_assign(&mut r, &rhs, &lead, i);
+        }
+        (q, r)
+    }
+}
+
 impl<'a> Div for Poly<'a> {
     type Output = (Poly<'a>, Poly<'a>);
 
     fn div(self, rhs: Poly<'a>) -> Self::Output {
-        let (mut q, mut r) = (Poly::zero(), self);
-        while !r.is_zero() && r.degree() >= rhs.degree() {
-            let lead_r = r[r.len() - 1];
-            let lead_d = rhs[rhs.len() - 1];
-            let mut t = Poly::zero();
-            t.set(
-                r.len() - rhs.len(),
-                lead_r * lead_d.invert().unwrap(),
-            );
-            q += &t;
-            r -= &(&rhs * &t);
-        }
-        (q, r)
+        self / &rhs
     }
 }
 
@@ -760,10 +885,11 @@ impl<'a> IndexMut<usize> for Poly<'a> {
 mod test {
     use std::collections::VecDeque;
 
-    use bls12_381::Scalar;
     use ff::Field;
 
     use super::Poly;
+
+    type Scalar = bls12_381::Scalar<0, true>;
 
     #[test]
     fn test_poly_add() {
@@ -908,10 +1034,11 @@ mod test {
             .collect::<Vec<_>>();
 
         let mut p = VecDeque::new();
+        p.push_back(Scalar::one());
         for s in scalars {
             let old_p = p.clone();
             Poly::mul_by_x_sub_s(&mut p, &s);
-            assert_eq!(old_p, Poly::div_by_x_plus_s(&p, &-s))
+            assert_eq!(old_p, Poly::div_by_x_plus_s(p.clone(), &-s))
         }
     }
 
