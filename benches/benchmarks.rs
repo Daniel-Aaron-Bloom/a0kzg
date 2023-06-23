@@ -1,6 +1,6 @@
 use std::{time::Duration};
 
-use bls12_381::{G2Projective, G2Affine, G1ProjectiveA};
+use bls12_381::{G2Projective, G2Affine, G1ProjectiveA, G1AffineA};
 use ff::Field;
 use a0kzg::{TrustedTau, Scalar, TrustedVerifier, TrustedProver, Prover, Verifier, UntrustedVerifier, UntrustedProver, kzg::{PowTauG1Projective, PowTauG2Projective, PowTauG1Affine, PowTauG2Affine, PowTauG1AffineBatch}, Poly};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -118,10 +118,11 @@ fn zkg(c: &mut Criterion) {
             b.iter(|| batch.poly_commitment_from_set(points))
         });
 
-        let v = TRUSTED_PROVER.poly_commitment_from_set(&POINTS[0..set_size]);
+        let (p, c) = TRUSTED_PROVER.poly_commitment_from_set(&POINTS[0..set_size]);
+        let (bp, bc) = batch.poly_commitment_from_set(&POINTS[0..set_size]);
         // assert_eq!(v, prvr_a.poly_commitment_from_set(&POINTS[0..set_size]));
         // assert_eq!(v, prvr_p.poly_commitment_from_set(&POINTS[0..set_size]));
-        let (p, c) = v;
+
         let c = c.into();
 
         for &proof_size in proof_sizes {
@@ -140,6 +141,11 @@ fn zkg(c: &mut Criterion) {
             group.bench_with_input(id, &(&p, &POINTS[0..proof_size]), |b, &(poly, points)| {
                 b.iter(|| prvr_p.prove(poly.clone(), points))
             });
+            let id = BenchmarkId::from_parameter(format!("batch untrusted prove {set_size}:{proof_size}"));
+            group.throughput(Throughput::Elements(proof_size as u64));
+            group.bench_with_input(id, &(&p, &POINTS[0..proof_size]), |b, &(poly, points)| {
+                b.iter(|| batch.prove(poly.clone(), points))
+            });
 
             let i = Poly::lagrange(&POINTS[0..proof_size]);
 
@@ -150,6 +156,7 @@ fn zkg(c: &mut Criterion) {
             });
 
             let pi = TRUSTED_PROVER.prove(p.clone(), &POINTS[0..proof_size]);
+            let bpi = G1Affine::from_compressed(&G1AffineA::from(batch.prove(p.clone(), &POINTS[0..proof_size])).to_compressed()).unwrap();
             // assert_eq!(prvr_a.prove(p.clone(), &POINTS[0..proof_size]), pi);
             // assert_eq!(prvr_p.prove(p.clone(), &POINTS[0..proof_size]), pi);
             let pi = pi.into();
@@ -173,6 +180,8 @@ fn zkg(c: &mut Criterion) {
             });
             assert!(vrfr_a.verify(&c, &POINTS[0..proof_size], &pi));
             assert!(vrfr_p.verify(&c, &POINTS[0..proof_size], &pi));
+            assert!(vrfr_a.verify(&c, &POINTS[0..proof_size], &bpi));
+            assert!(vrfr_p.verify(&c, &POINTS[0..proof_size], &bpi));
         }
     }
     group.finish();

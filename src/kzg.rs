@@ -411,7 +411,8 @@ impl PowTauG1AffineBatch {
     pub fn new<I>(i: I) -> Self
     where I: IntoIterator, I::Item: Borrow<G1ProjectiveA>{
         Self(
-            i.into_iter().map(|i| G1PrecomputeAffine::from(G1Precompute::from(*i.borrow()))).collect()
+            [G1ProjectiveA::generator()].into_iter().chain(i.into_iter().map(|g| *g.borrow()))
+                .map(|g| G1PrecomputeAffine::from(G1Precompute::from(g))).collect()
         )
     }
 
@@ -467,7 +468,7 @@ pub type Commitment = G1Projective;
 #[cfg(test)]
 mod test {
     use ff::Field;
-    use crate::{Scalar, TrustedTau, TrustedVerifier, TrustedProver, Prover, Verifier, UntrustedVerifier, kzg::{PowTauG1Projective, PowTauG2Projective}};
+    use super::*;
 
     #[test]
     fn test_zero_commit() {
@@ -521,5 +522,28 @@ mod test {
         
         // verify that the whole set exists in the whole set
         assert!(vrfr.verify(&c, &set, &proof0123));
+    }
+    #[test]
+    fn test_batch_commit() {
+        use bls12_381::{G1ProjectiveA, G1Affine, G1AffineA};
+        let points = (0..64)
+                .map(|_| (Scalar::random(rand::thread_rng()), Scalar::random(rand::thread_rng())))
+                .collect::<Vec<_>>();
+
+        let tau = TrustedTau(Scalar::random(rand::thread_rng()));
+        let batch: Vec<G1ProjectiveA> = tau.g1_projective_a_iter().take(points.len()).collect();
+        let affine: Vec<_> = tau.g1_affine_iter().take(points.len()).collect();
+
+
+        let prvr_b = PowTauG1AffineBatch::new(batch.iter());
+        let prvr_a = UntrustedProver::new(PowTauG1Affine(|| affine.iter()));
+
+        let (p, c) = prvr_a.poly_commitment_from_set(&points);
+        let (bp, bc) = prvr_b.poly_commitment_from_set(&points);
+
+        let ca = G1Affine::from(c);
+        let bca = G1AffineA::from(bc);
+        assert_eq!(p, bp);
+        assert_eq!(ca.to_compressed(), bca.to_compressed());
     }
 }
